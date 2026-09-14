@@ -60,11 +60,19 @@ pub enum HelperId {
     ForIter,
     EvalBreaker,
     Drop,
+    /// Compare the two raw stack operands without popping; returns 0/1, or
+    /// `FAST_PATH_MISS` when the operands are not both plain ints.
+    CompareFast,
+    /// Arithmetic on two int operands; on success the helper has already
+    /// replaced them with the result. Returns `FAST_PATH_MISS` otherwise.
+    BinaryOpIntFast,
 }
 
 impl HelperId {
-    pub const COUNT: usize = HelperId::Drop as usize + 1;
+    pub const COUNT: usize = HelperId::BinaryOpIntFast as usize + 1;
 }
+
+pub const FAST_PATH_MISS: i64 = 2;
 
 #[derive(Clone)]
 pub struct HelperTable {
@@ -152,7 +160,8 @@ const CTX: Reg = Reg::Rbx;
 const TOP: Reg = Reg::R12;
 const LOCALS: Reg = Reg::R13;
 const STACK: Reg = Reg::R14;
-const FRAME_SPACE: i32 = SHADOW_SPACE + 8;
+const SCRATCH: Reg = Reg::R15;
+const FRAME_SPACE: i32 = SHADOW_SPACE;
 
 struct Emitter<'a> {
     a: Assembler,
@@ -297,6 +306,76 @@ impl Emitter<'_> {
         self.discard_rax();
     }
 
+    fn push_bool_from_scratch(&mut self) {
+        let is_true = self.a.new_label();
+        let done = self.a.new_label();
+        self.a.cmp_ri(SCRATCH, 1);
+        self.a.jcc(Cond::E, is_true);
+        self.a.mov_ri(Reg::Rax, self.env.false_ptr | BORROW_TAG);
+        self.push(Reg::Rax);
+        self.a.jmp(done);
+        self.a.bind(is_true);
+        self.a.mov_ri(Reg::Rax, self.env.true_ptr | BORROW_TAG);
+        self.push(Reg::Rax);
+        self.a.bind(done);
+    }
+
+    /// Compare through the fast helper; on a miss fall back to the generic
+    /// helper. `fused` carries the conditional jump that consumes the result,
+    /// as (jump_on, target, index after the jump).
+    fn compare_op(&mut self, arg: u32, idx: usize, fused: Option<(bool, usize, usize)>) {
+        let miss = self.a.new_label();
+        let done = self.a.new_label();
+        self.call(HelperId::CompareFast, arg.into(), idx);
+        self.a.cmp_ri(Reg::Rax, FAST_PATH_MISS as i32);
+        self.a.jcc(Cond::E, miss);
+        self.a.mov_rr(SCRATCH, Reg::Rax);
+        self.pop_top();
+        self.pop_top();
+        match fused {
+            Some((jump_on, target, _)) => {
+                self.a.cmp_ri(SCRATCH, 1);
+                self.branch_to(if jump_on { Cond::E } else { Cond::NE }, target);
+            }
+            None => self.push_bool_from_scratch(),
+        }
+        self.a.jmp(done);
+        self.a.bind(miss);
+        self.call(HelperId::CompareOp, arg.into(), idx);
+        if let Some((jump_on, target, _)) = fused {
+            self.call(HelperId::PopIsTrue, 0, idx);
+            self.branch_if(if jump_on { Cond::E } else { Cond::NE }, target);
+        }
+        self.a.bind(done);
+        if let Some((_, _, after)) = fused {
+            self.jump(after);
+        }
+    }
+
+    fn binary_op_int(&mut self, arg: u32, idx: usize) {
+        let done = self.a.new_label();
+        self.call(HelperId::BinaryOpIntFast, arg.into(), idx);
+        self.a.cmp_ri(Reg::Rax, FAST_PATH_MISS as i32);
+        self.a.jcc(Cond::NE, done);
+        self.call(HelperId::BinaryOp, arg.into(), idx);
+        self.a.bind(done);
+    }
+
+    fn branch_to(&mut self, cond: Cond, target: usize) {
+        if target < self.len {
+            self.a.jcc(cond, self.labels[target]);
+        } else {
+            let skip = self.a.new_label();
+            let flipped = match cond {
+                Cond::E => Cond::NE,
+                _ => Cond::E,
+            };
+            self.a.jcc(flipped, skip);
+            self.exit(target);
+            self.a.bind(skip);
+        }
+    }
+
     fn load_small_int(&mut self, i: u32, idx: usize) {
         match (self.env.small_int)(i as i32) {
             Some(ptr) => {
@@ -317,18 +396,7 @@ impl Emitter<'_> {
 
     fn branch_if(&mut self, cond: Cond, target: usize) {
         self.a.cmp_ri(Reg::Rax, 1);
-        if target < self.len {
-            self.a.jcc(cond, self.labels[target]);
-        } else {
-            let skip = self.a.new_label();
-            let flipped = match cond {
-                Cond::E => Cond::NE,
-                _ => Cond::E,
-            };
-            self.a.jcc(flipped, skip);
-            self.exit(target);
-            self.a.bind(skip);
-        }
+        self.branch_to(cond, target);
     }
 
     /// Pop a value and branch to `target` when it is the bool singleton
@@ -413,7 +481,10 @@ pub fn compile(
     a.push(TOP);
     a.push(LOCALS);
     a.push(STACK);
-    a.sub_ri(Reg::Rsp, FRAME_SPACE);
+    a.push(SCRATCH);
+    if FRAME_SPACE > 0 {
+        a.sub_ri(Reg::Rsp, FRAME_SPACE);
+    }
     a.mov_rr(CTX, ARG0);
     a.mov_rm(LOCALS, CTX, CTX_LOCALS);
     a.mov_rm(Reg::Rax, CTX, CTX_STACK_TOP);
@@ -434,8 +505,19 @@ pub fn compile(
 
     let mut arg_state = OpArgState::default();
     let mut idx = 0;
+    let mut fused_jump: Option<usize> = None;
     while idx < units.len() {
         e.a.bind(e.labels[idx]);
+        if fused_jump == Some(idx) {
+            fused_jump = None;
+            let caches = units[idx].op.cache_entries();
+            e.exit(idx);
+            for skipped in idx + 1..(idx + 1 + caches).min(units.len()) {
+                e.a.bind(e.labels[skipped]);
+            }
+            idx += 1 + caches;
+            continue;
+        }
         let unit = units[idx];
         let (raw_op, arg) = arg_state.get(unit);
         let op = raw_op.deoptimize();
@@ -471,8 +553,27 @@ pub fn compile(
             Instruction::LoadConst { .. } => e.call(HelperId::LoadConst, argv.into(), idx),
             Instruction::LoadSmallInt { .. } => e.load_small_int(argv, idx),
             Instruction::LoadGlobal { .. } => e.call(HelperId::LoadGlobal, argv.into(), idx),
-            Instruction::BinaryOp { .. } => e.call(HelperId::BinaryOp, argv.into(), idx),
-            Instruction::CompareOp { .. } => e.call(HelperId::CompareOp, argv.into(), idx),
+            Instruction::BinaryOp { .. } => match raw_op {
+                Instruction::BinaryOpAddInt
+                | Instruction::BinaryOpSubtractInt
+                | Instruction::BinaryOpMultiplyInt => e.binary_op_int(argv, idx),
+                _ => e.call(HelperId::BinaryOp, argv.into(), idx),
+            },
+            Instruction::CompareOp { .. } => {
+                let fused = units.get(next).and_then(|pj| {
+                    let jump_on = match pj.op.deoptimize() {
+                        Instruction::PopJumpIfFalse { .. } => false,
+                        Instruction::PopJumpIfTrue { .. } => true,
+                        _ => return None,
+                    };
+                    let after = next + 1 + pj.op.cache_entries();
+                    Some((jump_on, after + pj.arg.as_u32() as usize, after))
+                });
+                if fused.is_some() {
+                    fused_jump = Some(next);
+                }
+                e.compare_op(argv, idx, fused);
+            }
             Instruction::ToBool => e.call(HelperId::ToBool, 0, idx),
             Instruction::UnaryNot => e.call(HelperId::UnaryNot, 0, idx),
             Instruction::UnaryNegative => e.call(HelperId::UnaryNegative, 0, idx),
@@ -513,7 +614,10 @@ pub fn compile(
     e.a.bind(e.epilogue);
     e.a.mov_rm(Reg::Rcx, CTX, CTX_STACK_TOP);
     e.a.mov_mr32(Reg::Rcx, 0, TOP);
-    e.a.add_ri(Reg::Rsp, FRAME_SPACE);
+    if FRAME_SPACE > 0 {
+        e.a.add_ri(Reg::Rsp, FRAME_SPACE);
+    }
+    e.a.pop(SCRATCH);
     e.a.pop(STACK);
     e.a.pop(LOCALS);
     e.a.pop(TOP);
@@ -627,7 +731,21 @@ mod tests {
     fake!(f_for_iter, HelperId::ForIter);
     fake!(f_eval_breaker, HelperId::EvalBreaker);
     fake!(f_drop, HelperId::Drop);
+    fake!(f_compare_fast, HelperId::CompareFast);
+    fake!(f_to_bool, HelperId::ToBool);
     fake!(f_generic, HelperId::LoadGlobal);
+
+    /// Pretends the int fast path succeeded: drops one operand slot.
+    extern "C" fn f_binary_op_int_fast(ctx: *mut JitContext, arg: u64) -> i64 {
+        let r = record(HelperId::BinaryOpIntFast, arg);
+        if r == 0 {
+            unsafe {
+                let top = &mut *(*ctx).stack_top;
+                *top -= 1;
+            }
+        }
+        r
+    }
 
     /// Pretends to pop two operands and push one result, through the shared
     /// stack_top word like a real helper would.
@@ -653,6 +771,9 @@ mod tests {
         t.set(HelperId::ForIter, f_for_iter);
         t.set(HelperId::EvalBreaker, f_eval_breaker);
         t.set(HelperId::Drop, f_drop);
+        t.set(HelperId::CompareFast, f_compare_fast);
+        t.set(HelperId::ToBool, f_to_bool);
+        t.set(HelperId::BinaryOpIntFast, f_binary_op_int_fast);
         t
     }
 
@@ -1082,20 +1203,17 @@ mod tests {
     fn specialized_ops_are_compiled_as_their_base_op() {
         let mut v = vec![u(LOAD_SMALL_INT, 5), u(LOAD_SMALL_INT, 5)];
         v.extend(with_caches(
-            Instruction::BinaryOpAddInt,
-            BinaryOperator::Add as u8,
+            Instruction::BinaryOpSubscrListInt,
+            BinaryOperator::Subscr as u8,
         ));
-        v.extend(with_caches(
-            Instruction::CompareOpInt,
-            ComparisonOperator::Less as u8,
-        ));
+        v.extend(with_caches(Instruction::ToBoolInt, 0));
         v.push(u(RETURN, 0));
         let (_, calls) = run(&v, 0, vec![]);
-        assert_eq!(calls[0], (HelperId::BinaryOp, BinaryOperator::Add as u64));
         assert_eq!(
-            calls[1],
-            (HelperId::CompareOp, ComparisonOperator::Less as u64)
+            calls[0],
+            (HelperId::BinaryOp, BinaryOperator::Subscr as u64)
         );
+        assert_eq!(calls[1], (HelperId::ToBool, 0));
     }
 
     #[test]
@@ -1124,6 +1242,141 @@ mod tests {
         use HelperId::*;
         assert_eq!(ids(&calls), [ForIter, EvalBreaker, ForIter]);
         assert_eq!(calls[0].1, end_for as u64);
+    }
+
+    #[test]
+    fn compare_fast_hit_pops_operands_and_pushes_bool_singleton() {
+        let a = Obj::new(1);
+        let b = Obj::new(1);
+        let s = singletons();
+        for (result, expect) in [(1i64, s.t.ptr()), (0, s.f.ptr())] {
+            let mut frame = Frame::new(1, 4);
+            frame.push(a.ptr());
+            frame.push(b.ptr() | BORROW_TAG);
+            a.rc.store(2, Relaxed);
+            let mut units = vec![];
+            units.extend(with_caches(
+                Instruction::CompareOp {
+                    opname: Arg::marker(),
+                },
+                ComparisonOperator::Less as u8,
+            ));
+            units.push(u(RETURN, 0));
+            let (lasti, calls) = run_with(&units, 0, vec![result], &mut frame, &s);
+            assert_eq!(lasti, units.len() as u32 - 1);
+            assert_eq!(
+                calls,
+                [(HelperId::CompareFast, ComparisonOperator::Less as u64)]
+            );
+            assert_eq!(frame.stack(), [(expect | BORROW_TAG) as usize]);
+            assert_eq!(a.rc(), 1);
+            assert_eq!(b.rc(), 1);
+        }
+    }
+
+    #[test]
+    fn compare_fast_miss_falls_back_to_generic_helper() {
+        let mut units = vec![u(LOAD_SMALL_INT, 5), u(LOAD_SMALL_INT, 5)];
+        units.extend(with_caches(
+            Instruction::CompareOpInt,
+            ComparisonOperator::Equal as u8,
+        ));
+        units.push(u(RETURN, 0));
+        let (_, calls) = run(&units, 0, vec![FAST_PATH_MISS]);
+        assert_eq!(ids(&calls), [HelperId::CompareFast, HelperId::CompareOp]);
+    }
+
+    fn compare_then_jump(jump_op: Instruction) -> (Vec<CodeUnit>, u32) {
+        let mut v = vec![u(LOAD_SMALL_INT, 5), u(LOAD_SMALL_INT, 5)];
+        v.extend(with_caches(
+            Instruction::CompareOp {
+                opname: Arg::marker(),
+            },
+            ComparisonOperator::Less as u8,
+        ));
+        let pj = v.len();
+        v.extend(with_caches(jump_op, 0));
+        v.push(u(LOAD_SMALL_INT, 5));
+        v.push(u(STORE_FAST, 0));
+        let ret = v.len();
+        v.push(u(RETURN, 0));
+        let after = pj + 1 + caches(jump_op) as usize;
+        v[pj].arg = OpArgByte::new((ret - after) as u8);
+        (v, ret as u32)
+    }
+
+    #[test]
+    fn compare_fused_with_pop_jump_branches_without_touching_the_stack() {
+        let s = singletons();
+        for (op, result, expect_body) in [
+            (POP_JUMP_IF_FALSE, 0i64, false),
+            (POP_JUMP_IF_FALSE, 1, true),
+            (POP_JUMP_IF_TRUE, 1, false),
+            (POP_JUMP_IF_TRUE, 0, true),
+        ] {
+            let (units, ret) = compare_then_jump(op);
+            let mut frame = Frame::new(1, 4);
+            let (lasti, calls) = run_with(&units, 0, vec![result], &mut frame, &s);
+            assert_eq!(lasti, ret);
+            assert_eq!(ids(&calls), [HelperId::CompareFast]);
+            assert_eq!(frame.stack_top, 0);
+            let body_ran = frame.data[0] == s.five.ptr() as usize;
+            assert_eq!(body_ran, expect_body);
+        }
+    }
+
+    #[test]
+    fn compare_fused_miss_uses_generic_compare_and_pop_helper() {
+        let (units, ret) = compare_then_jump(POP_JUMP_IF_FALSE);
+        let (lasti, calls) = run(&units, 0, vec![FAST_PATH_MISS, 0, 1]);
+        assert_eq!(lasti, ret);
+        assert_eq!(
+            ids(&calls),
+            [
+                HelperId::CompareFast,
+                HelperId::CompareOp,
+                HelperId::PopIsTrue
+            ]
+        );
+    }
+
+    #[test]
+    fn entering_at_a_fused_jump_exits_to_the_interpreter() {
+        let (units, _) = compare_then_jump(POP_JUMP_IF_FALSE);
+        let pj = units
+            .iter()
+            .position(|c| matches!(c.op, Instruction::PopJumpIfFalse { .. }))
+            .unwrap();
+        let (lasti, calls) = run(&units, pj, vec![]);
+        assert_eq!(lasti, pj as u32);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn specialized_int_binary_op_uses_fast_helper_then_generic_on_miss() {
+        let mut units = vec![u(LOAD_SMALL_INT, 5), u(LOAD_SMALL_INT, 5)];
+        units.extend(with_caches(
+            Instruction::BinaryOpAddInt,
+            BinaryOperator::Add as u8,
+        ));
+        units.push(u(LOAD_SMALL_INT, 5));
+        units.extend(with_caches(
+            Instruction::BinaryOpSubtractInt,
+            BinaryOperator::Subtract as u8,
+        ));
+        units.push(u(RETURN, 0));
+        let mut frame = Frame::new(1, 4);
+        let s = singletons();
+        let (_, calls) = run_with(&units, 0, vec![0, FAST_PATH_MISS], &mut frame, &s);
+        assert_eq!(
+            ids(&calls),
+            [
+                HelperId::BinaryOpIntFast,
+                HelperId::BinaryOpIntFast,
+                HelperId::BinaryOp
+            ]
+        );
+        assert_eq!(frame.stack_top, 1);
     }
 
     #[test]

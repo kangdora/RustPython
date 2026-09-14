@@ -1,13 +1,13 @@
 use super::{ExecutingFrame, FrameResult};
 use crate::{
     AsObject, PyObject, PyResult, VirtualMachine,
-    builtins::PyBaseExceptionRef,
+    builtins::{PyBaseExceptionRef, PyInt},
     bytecode::{self, Label, OpArg},
 };
 use core::ffi::c_void;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use rustpython_tier2::{Env, HelperId, HelperTable, JitContext, compile};
+use rustpython_tier2::{Env, FAST_PATH_MISS, HelperId, HelperTable, JitContext, compile};
 use std::sync::OnceLock;
 
 pub(crate) static COMPILED: AtomicUsize = AtomicUsize::new(0);
@@ -239,6 +239,44 @@ extern "C" fn h_eval_breaker(ctx: *mut JitContext, _arg: u64) -> i64 {
     })
 }
 
+extern "C" fn h_compare_fast(ctx: *mut JitContext, arg: u64) -> i64 {
+    with(ctx, |f, vm| {
+        let b = f.top_value();
+        let a = f.nth_value(1);
+        if let (Some(a_int), Some(b_int)) = (
+            a.downcast_ref_if_exact::<PyInt>(vm),
+            b.downcast_ref_if_exact::<PyInt>(vm),
+        ) {
+            let op = f.compare_op_from_arg(OpArg::new(arg as u32));
+            return Ok(op.eval_ord(a_int.as_bigint().cmp(b_int.as_bigint())) as i64);
+        }
+        Ok(FAST_PATH_MISS)
+    })
+}
+
+extern "C" fn h_binary_op_int_fast(ctx: *mut JitContext, arg: u64) -> i64 {
+    with(ctx, |f, vm| {
+        let b = f.top_value();
+        let a = f.nth_value(1);
+        let (Some(a_int), Some(b_int)) = (
+            a.downcast_ref_if_exact::<PyInt>(vm),
+            b.downcast_ref_if_exact::<PyInt>(vm),
+        ) else {
+            return Ok(FAST_PATH_MISS);
+        };
+        let result = match bytecode::BinaryOperator::try_from(arg as u32) {
+            Ok(bytecode::BinaryOperator::Add) => ExecutingFrame::int_add(a_int, b_int, vm),
+            Ok(bytecode::BinaryOperator::Subtract) => ExecutingFrame::int_sub(a_int, b_int, vm),
+            Ok(bytecode::BinaryOperator::Multiply) => ExecutingFrame::int_mul(a_int, b_int, vm),
+            _ => return Ok(FAST_PATH_MISS),
+        };
+        f.pop_stackref();
+        f.pop_stackref();
+        f.push_value(result);
+        Ok(0)
+    })
+}
+
 extern "C" fn h_drop(_ctx: *mut JitContext, arg: u64) -> i64 {
     let ptr = arg as *mut PyObject;
     unsafe { PyObject::drop_at_zero(NonNull::new_unchecked(ptr)) };
@@ -277,6 +315,8 @@ fn helper_table() -> &'static HelperTable {
         t.set(HelperId::ForIter, h_for_iter);
         t.set(HelperId::EvalBreaker, h_eval_breaker);
         t.set(HelperId::Drop, h_drop);
+        t.set(HelperId::CompareFast, h_compare_fast);
+        t.set(HelperId::BinaryOpIntFast, h_binary_op_int_fast);
         t
     })
 }
