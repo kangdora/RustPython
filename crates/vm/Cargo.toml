@@ -19,6 +19,7 @@ vm-tracing-logging = []
 flame-it = ["flame", "flamer"]
 freeze-stdlib = ["encodings"]
 jit = ["rustpython-jit"]
+tier2 = ["rustpython-tier2"]
 threading = ["rustpython-common/threading"]
 gc = []
 compiler = ["parser", "codegen", "rustpython-compiler"]
@@ -35,6 +36,7 @@ rustpython-common = { workspace = true }
 rustpython-derive = { workspace = true }
 rustpython-host_env = { workspace = true }
 rustpython-jit = { workspace = true, optional = true }
+rustpython-tier2 = { workspace = true, optional = true }
 
 ruff_python_ast = { workspace = true, optional = true }
 ruff_python_parser = { workspace = true }

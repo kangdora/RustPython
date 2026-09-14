@@ -4073,6 +4073,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustpython-tier2"
+version = "0.5.0"
+dependencies = [
+ "libc",
+ "rustpython-compiler-core",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "rustpython-unicode"
 version = "0.6.0"
 dependencies = [
@@ -4135,6 +4144,7 @@ dependencies = [
  "rustpython-ruff_python_parser",
  "rustpython-ruff_text_size",
  "rustpython-sre_engine",
+ "rustpython-tier2",
  "rustpython-unicode",
  "scopeguard",
  "serde_core",

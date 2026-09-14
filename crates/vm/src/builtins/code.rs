@@ -489,6 +489,8 @@ pub struct PyCode {
     /// this code cannot leave the slot unbalanced, so `with_frame` skips the
     /// exc_info save/restore. Computed once by scanning the instruction stream.
     pub has_exc_handling: bool,
+    #[cfg(feature = "tier2")]
+    pub tier2_code: std::sync::OnceLock<Option<rustpython_tier2::Compiled>>,
 }
 
 impl Deref for PyCode {
@@ -620,6 +622,8 @@ impl PyCode {
             monitoring_data: PyMutex::new(None),
             quickened: core::sync::atomic::AtomicBool::new(false),
             has_exc_handling,
+            #[cfg(feature = "tier2")]
+            tier2_code: std::sync::OnceLock::new(),
         }
     }
 

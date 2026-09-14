@@ -9,18 +9,50 @@ pub(crate) use sys::{DOC, MAXSIZE, RUST_MULTIARCH, UnraisableHookArgsData, modul
 
 #[pymodule(name = "_jit")]
 mod sys_jit {
+    #[cfg(feature = "tier2")]
+    use crate::{PyResult, VirtualMachine, builtins::PyDictRef};
+
     /// Return True if the current Python executable supports JIT compilation,
     /// and False otherwise.
     #[pyfunction]
     const fn is_available() -> bool {
-        false // RustPython has no JIT
+        cfg!(feature = "tier2")
     }
 
     /// Return True if JIT compilation is enabled for the current Python process,
     /// and False otherwise.
     #[pyfunction]
     const fn is_enabled() -> bool {
-        false // RustPython has no JIT
+        cfg!(feature = "tier2")
+    }
+
+    #[cfg(feature = "tier2")]
+    #[pyfunction]
+    fn stats(vm: &VirtualMachine) -> PyResult<PyDictRef> {
+        use crate::frame::tier2;
+        use core::sync::atomic::Ordering::Relaxed;
+        let d = vm.ctx.new_dict();
+        d.set_item(
+            "compiled",
+            vm.ctx.new_int(tier2::COMPILED.load(Relaxed)).into(),
+            vm,
+        )?;
+        d.set_item(
+            "compile_failed",
+            vm.ctx.new_int(tier2::COMPILE_FAILED.load(Relaxed)).into(),
+            vm,
+        )?;
+        d.set_item(
+            "entered",
+            vm.ctx.new_int(tier2::ENTERED.load(Relaxed)).into(),
+            vm,
+        )?;
+        d.set_item(
+            "errors",
+            vm.ctx.new_int(tier2::ERRORS.load(Relaxed)).into(),
+            vm,
+        )?;
+        Ok(d)
     }
 
     /// Return True if the topmost Python frame is currently executing JIT code,

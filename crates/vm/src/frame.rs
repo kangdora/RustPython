@@ -2,6 +2,9 @@
 
 use crate::anystr::AnyStr;
 
+#[cfg(feature = "tier2")]
+pub(crate) mod tier2;
+
 use crate::{
     AsObject, Py, PyExact, PyObject, PyObjectRef, PyPayload, PyRef, PyResult, PyStackRef,
     TryFromObject, VirtualMachine,
@@ -3160,6 +3163,12 @@ impl ExecutingFrame<'_> {
             }
             let lasti_before = self.lasti();
             let result = self.execute_instruction(op, arg, &mut do_extend_arg, vm);
+            #[cfg(feature = "tier2")]
+            let idx = if result.is_err() && matches!(op, Instruction::JumpBackwardJit) {
+                self.lasti() as usize - 1
+            } else {
+                idx
+            };
             // Skip inline cache entries if instruction fell through (no jump).
             if caches > 0 && self.lasti() == lasti_before {
                 self.update_lasti(|i| *i += caches as u32);
@@ -4217,6 +4226,26 @@ impl ExecutingFrame<'_> {
                 // CPython rewrites JUMP_BACKWARD to JUMP_BACKWARD_NO_JIT
                 // when JIT is unavailable.
                 let instr_idx = self.lasti() as usize - 1;
+                #[cfg(feature = "tier2")]
+                {
+                    let cache_base = instr_idx + 1;
+                    let counter = self.code.instructions.read_adaptive_counter(cache_base);
+                    if bytecode::adaptive_counter_triggers(counter) {
+                        unsafe {
+                            self.code
+                                .instructions
+                                .replace_op(instr_idx, Instruction::JumpBackwardJit);
+                        }
+                    } else {
+                        unsafe {
+                            self.code.instructions.write_adaptive_counter(
+                                cache_base,
+                                bytecode::advance_adaptive_counter(counter),
+                            );
+                        }
+                    }
+                }
+                #[cfg(not(feature = "tier2"))]
                 unsafe {
                     self.code
                         .instructions
@@ -4225,6 +4254,20 @@ impl ExecutingFrame<'_> {
                 self.jump_relative_backward(u32::from(arg), 1);
                 Ok(None)
             }
+            #[cfg(feature = "tier2")]
+            Instruction::JumpBackwardJit => {
+                self.jump_relative_backward(u32::from(arg), 1);
+                if vm.use_tracing.get() {
+                    return Ok(None);
+                }
+                self.tier2_run(vm)
+            }
+            #[cfg(feature = "tier2")]
+            Instruction::JumpBackwardNoJit => {
+                self.jump_relative_backward(u32::from(arg), 1);
+                Ok(None)
+            }
+            #[cfg(not(feature = "tier2"))]
             Instruction::JumpBackwardJit | Instruction::JumpBackwardNoJit => {
                 self.jump_relative_backward(u32::from(arg), 1);
                 Ok(None)
