@@ -1,12 +1,13 @@
 use super::{ExecutingFrame, FrameResult};
 use crate::{
-    PyResult, VirtualMachine,
+    AsObject, PyObject, PyResult, VirtualMachine,
     builtins::PyBaseExceptionRef,
     bytecode::{self, Label, OpArg},
 };
 use core::ffi::c_void;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use rustpython_tier2::{HelperId, HelperTable, JitContext, compile};
+use rustpython_tier2::{Env, HelperId, HelperTable, JitContext, compile};
 use std::sync::OnceLock;
 
 pub(crate) static COMPILED: AtomicUsize = AtomicUsize::new(0);
@@ -238,6 +239,12 @@ extern "C" fn h_eval_breaker(ctx: *mut JitContext, _arg: u64) -> i64 {
     })
 }
 
+extern "C" fn h_drop(_ctx: *mut JitContext, arg: u64) -> i64 {
+    let ptr = arg as *mut PyObject;
+    unsafe { PyObject::drop_at_zero(NonNull::new_unchecked(ptr)) };
+    0
+}
+
 extern "C" fn h_unreachable(ctx: *mut JitContext, _arg: u64) -> i64 {
     with(ctx, |_f, vm| {
         Err(vm.new_system_error("tier2 helper not wired"))
@@ -269,15 +276,28 @@ fn helper_table() -> &'static HelperTable {
         t.set(HelperId::Swap, h_swap);
         t.set(HelperId::ForIter, h_for_iter);
         t.set(HelperId::EvalBreaker, h_eval_breaker);
+        t.set(HelperId::Drop, h_drop);
         t
     })
+}
+
+fn object_addr(obj: &PyObject) -> u64 {
+    obj as *const PyObject as u64
 }
 
 impl ExecutingFrame<'_> {
     pub(super) fn tier2_run(&mut self, vm: &VirtualMachine) -> FrameResult {
         let code = self.code;
         let compiled = code.tier2_code.get_or_init(|| {
-            let compiled = compile(&code.code.instructions, helper_table()).ok();
+            let small_int = |i: i32| Some(object_addr(vm.ctx.cached_int(i).as_object()));
+            let env = Env {
+                refcount_offset: PyObject::refcount_offset() as i32,
+                true_ptr: object_addr(vm.ctx.true_value.as_object()),
+                false_ptr: object_addr(vm.ctx.false_value.as_object()),
+                none_ptr: object_addr(vm.ctx.none.as_object()),
+                small_int: &small_int,
+            };
+            let compiled = compile(&code.code.instructions, helper_table(), &env).ok();
             if compiled.is_some() {
                 COMPILED.fetch_add(1, Relaxed);
             } else {
@@ -298,7 +318,15 @@ impl ExecutingFrame<'_> {
             vm,
             error: None,
         };
-        let mut jit_ctx = JitContext::new((&mut ctx as *mut Ctx).cast::<c_void>());
+        let nlocalsplus = self.localsplus.nlocalsplus as u64;
+        let locals = self.localsplus.data_as_mut_slice().as_mut_ptr();
+        let stack_top: *mut u32 = &mut self.localsplus.stack_top;
+        let mut jit_ctx = JitContext::new(
+            (&mut ctx as *mut Ctx).cast::<c_void>(),
+            locals,
+            stack_top,
+            nlocalsplus,
+        );
         let lasti = unsafe { compiled.run(&mut jit_ctx, entry) };
         self.update_lasti(|i| *i = lasti);
         match ctx.error.take() {

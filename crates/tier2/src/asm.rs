@@ -177,6 +177,66 @@ impl Assembler {
         self.buf.extend_from_slice(&imm.to_le_bytes());
     }
 
+    pub fn mov_rm32(&mut self, dst: Reg, base: Reg, disp: i32) {
+        self.rex(false, dst, base);
+        self.byte(0x8B);
+        self.modrm_mem(dst.low(), base, disp);
+    }
+
+    pub fn mov_mr32(&mut self, base: Reg, disp: i32, src: Reg) {
+        self.rex(false, src, base);
+        self.byte(0x89);
+        self.modrm_mem(src.low(), base, disp);
+    }
+
+    fn rex_idx(&mut self, reg: Reg, index: Reg, base: Reg) {
+        let mut rex = 0x48;
+        if reg.ext() {
+            rex |= 0x04;
+        }
+        if index.ext() {
+            rex |= 0x02;
+        }
+        if base.ext() {
+            rex |= 0x01;
+        }
+        self.byte(rex);
+    }
+
+    fn modrm_idx8(&mut self, reg: u8, base: Reg, index: Reg, disp: i8) {
+        self.byte(0x44 | (reg << 3));
+        self.byte(0xC0 | (index.low() << 3) | base.low());
+        self.byte(disp as u8);
+    }
+
+    pub fn mov_rm_idx8(&mut self, dst: Reg, base: Reg, index: Reg, disp: i8) {
+        self.rex_idx(dst, index, base);
+        self.byte(0x8B);
+        self.modrm_idx8(dst.low(), base, index, disp);
+    }
+
+    pub fn mov_mr_idx8(&mut self, base: Reg, index: Reg, disp: i8, src: Reg) {
+        self.rex_idx(src, index, base);
+        self.byte(0x89);
+        self.modrm_idx8(src.low(), base, index, disp);
+    }
+
+    pub fn lock_xadd(&mut self, base: Reg, disp: i32, src: Reg) {
+        self.byte(0xF0);
+        self.rex_w(src, base);
+        self.byte(0x0F);
+        self.byte(0xC1);
+        self.modrm_mem(src.low(), base, disp);
+    }
+
+    pub fn lock_add_mi(&mut self, base: Reg, disp: i32, imm: i32) {
+        self.byte(0xF0);
+        self.rex_w(Reg::Rax, base);
+        self.byte(0x81);
+        self.modrm_mem(0, base, disp);
+        self.buf.extend_from_slice(&imm.to_le_bytes());
+    }
+
     pub fn mov_mi32(&mut self, base: Reg, disp: i32, imm: i32) {
         self.rex_w(Reg::Rax, base);
         self.byte(0xC7);
@@ -203,6 +263,10 @@ impl Assembler {
 
     pub fn sub_rr(&mut self, dst: Reg, src: Reg) {
         self.alu_rr(0x29, dst, src);
+    }
+
+    pub fn and_rr(&mut self, dst: Reg, src: Reg) {
+        self.alu_rr(0x21, dst, src);
     }
 
     pub fn cmp_rr(&mut self, a: Reg, b: Reg) {
@@ -242,6 +306,10 @@ impl Assembler {
 
     pub fn shl_ri(&mut self, dst: Reg, imm: u8) {
         self.shift_ri(4, dst, imm);
+    }
+
+    pub fn shr_ri(&mut self, dst: Reg, imm: u8) {
+        self.shift_ri(5, dst, imm);
     }
 
     pub fn sar_ri(&mut self, dst: Reg, imm: u8) {
@@ -384,6 +452,48 @@ mod tests {
             asm(|a| a.imul_rr(Reg::Rax, Reg::Rcx)),
             [0x48, 0x0F, 0xAF, 0xC1]
         );
+    }
+
+    #[test]
+    fn thirty_two_bit_moves_and_indexed_moves() {
+        assert_eq!(
+            asm(|a| a.mov_rm32(Reg::R12, Reg::Rax, 0)),
+            [0x44, 0x8B, 0xA0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            asm(|a| a.mov_mr32(Reg::Rax, 0, Reg::R12)),
+            [0x44, 0x89, 0xA0, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            asm(|a| a.mov_rm32(Reg::Rax, Reg::Rcx, 4)),
+            [0x8B, 0x81, 4, 0, 0, 0]
+        );
+        assert_eq!(
+            asm(|a| a.mov_rm_idx8(Reg::Rax, Reg::R14, Reg::R12, 0)),
+            [0x4B, 0x8B, 0x44, 0xE6, 0x00]
+        );
+        assert_eq!(
+            asm(|a| a.mov_rm_idx8(Reg::Rax, Reg::R14, Reg::R12, -8)),
+            [0x4B, 0x8B, 0x44, 0xE6, 0xF8]
+        );
+        assert_eq!(
+            asm(|a| a.mov_mr_idx8(Reg::R14, Reg::R12, 0, Reg::Rax)),
+            [0x4B, 0x89, 0x44, 0xE6, 0x00]
+        );
+    }
+
+    #[test]
+    fn locked_refcount_ops_and_bit_ops() {
+        assert_eq!(
+            asm(|a| a.lock_xadd(Reg::Rax, 0, Reg::Rdx)),
+            [0xF0, 0x48, 0x0F, 0xC1, 0x90, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            asm(|a| a.lock_add_mi(Reg::Rax, 0, 1)),
+            [0xF0, 0x48, 0x81, 0x80, 0, 0, 0, 0, 1, 0, 0, 0]
+        );
+        assert_eq!(asm(|a| a.and_rr(Reg::Rax, Reg::Rcx)), [0x48, 0x21, 0xC8]);
+        assert_eq!(asm(|a| a.shr_ri(Reg::Rcx, 61)), [0x48, 0xC1, 0xE9, 61]);
     }
 
     #[test]

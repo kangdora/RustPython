@@ -2002,6 +2002,21 @@ impl PyObject {
         unsafe { dealloc(ptr.as_ptr()) }
     }
 
+    /// Byte offset of the strong-count word from the start of an object.
+    pub(crate) const fn refcount_offset() -> usize {
+        core::mem::offset_of!(PyInner<Erased>, ref_count)
+    }
+
+    /// Finish destroying an object whose strong count was already brought
+    /// to zero by an external decrement.
+    ///
+    /// # Safety
+    /// `ptr` must point to a live object whose strong count is exactly zero
+    /// and that no other reference will touch again.
+    pub(crate) unsafe fn drop_at_zero(ptr: NonNull<Self>) {
+        unsafe { Self::drop_slow(ptr) }
+    }
+
     /// # Safety
     /// This call will make the object live forever.
     pub(crate) unsafe fn mark_intern(&self) {
