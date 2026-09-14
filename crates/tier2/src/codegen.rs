@@ -9,13 +9,19 @@ pub struct JitContext {
     pub locals: *mut usize,
     pub stack_top: *mut u32,
     pub nlocalsplus: u64,
+    /// Back-edges left before the eval breaker is consulted again.
+    pub breaker_countdown: u64,
 }
 
 const CTX_LOCALS: i32 = 8;
 const CTX_STACK_TOP: i32 = 16;
 const CTX_NLOCALSPLUS: i32 = 24;
+const CTX_BREAKER: i32 = 32;
 
-const _: () = assert!(core::mem::size_of::<JitContext>() == 32);
+const _: () = assert!(core::mem::size_of::<JitContext>() == 40);
+
+/// How many back-edges run between two eval-breaker checks.
+pub const BREAKER_INTERVAL: u64 = 64;
 
 impl JitContext {
     pub fn new(
@@ -29,6 +35,7 @@ impl JitContext {
             locals,
             stack_top,
             nlocalsplus,
+            breaker_countdown: 1,
         }
     }
 }
@@ -352,6 +359,15 @@ impl Emitter<'_> {
         }
     }
 
+    fn eval_breaker(&mut self, idx: usize) {
+        let skip = self.a.new_label();
+        self.a.sub_mi(CTX, CTX_BREAKER, 1);
+        self.a.jcc(Cond::NE, skip);
+        self.call(HelperId::EvalBreaker, 0, idx);
+        self.a.mov_mi32(CTX, CTX_BREAKER, BREAKER_INTERVAL as i32);
+        self.a.bind(skip);
+    }
+
     fn binary_op_int(&mut self, arg: u32, idx: usize) {
         let done = self.a.new_label();
         self.call(HelperId::BinaryOpIntFast, arg.into(), idx);
@@ -598,7 +614,7 @@ pub fn compile(
             }
             Instruction::JumpForward { .. } => e.jump(forward(argv)),
             Instruction::JumpBackward { .. } => {
-                e.call(HelperId::EvalBreaker, 0, idx);
+                e.eval_breaker(idx);
                 e.jump(backward(argv));
             }
             Instruction::JumpBackwardNoInterrupt { .. } => e.jump(backward(argv)),
@@ -725,7 +741,15 @@ mod tests {
     fake!(f_load_small_int, HelperId::LoadSmallInt);
     fake!(f_load_const, HelperId::LoadConst);
     fake!(f_compare_op, HelperId::CompareOp);
-    fake!(f_pop_is_true, HelperId::PopIsTrue);
+    /// Pops the tested value through the shared stack_top word, like the
+    /// real helper does.
+    extern "C" fn f_pop_is_true(ctx: *mut JitContext, arg: u64) -> i64 {
+        unsafe {
+            let top = &mut *(*ctx).stack_top;
+            *top -= 1;
+        }
+        record(HelperId::PopIsTrue, arg)
+    }
     fake!(f_pop_is_none, HelperId::PopIsNone);
     fake!(f_pop_top, HelperId::PopTop);
     fake!(f_for_iter, HelperId::ForIter);
@@ -1134,14 +1158,40 @@ mod tests {
         let mut frame = Frame::new(1, 4);
         frame.data[0] = other.ptr() as usize;
         let s = singletons();
-        let (lasti, calls) = run_with(&units, 0, vec![1, 0, 1, 0, 0], &mut frame, &s);
+        let (lasti, calls) = run_with(&units, 0, vec![1, 0, 1, 0], &mut frame, &s);
         assert_eq!(lasti, ret);
         use HelperId::*;
-        assert_eq!(
-            ids(&calls),
-            [PopIsTrue, EvalBreaker, PopIsTrue, EvalBreaker, PopIsTrue]
-        );
+        assert_eq!(ids(&calls), [PopIsTrue, EvalBreaker, PopIsTrue, PopIsTrue]);
         assert_eq!(other.rc(), 4);
+    }
+
+    #[test]
+    fn eval_breaker_is_consulted_on_the_first_back_edge_then_every_interval() {
+        let (units, _, _) = while_loop();
+        let other = Obj::new(1);
+        let mut frame = Frame::new(1, 4);
+        frame.data[0] = other.ptr() as usize;
+        let s = singletons();
+        let iterations = BREAKER_INTERVAL as usize + 2;
+        let mut script = vec![];
+        for _ in 0..iterations {
+            script.push(1);
+        }
+        script.push(0);
+        let (_, calls) = run_with(&units, 0, script, &mut frame, &s);
+        let breaker_calls = calls
+            .iter()
+            .filter(|c| c.0 == HelperId::EvalBreaker)
+            .count();
+        assert_eq!(breaker_calls, 2);
+        let positions: Vec<usize> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.0 == HelperId::EvalBreaker)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(positions[0], 1);
+        assert_eq!(positions[1], 2 + BREAKER_INTERVAL as usize);
     }
 
     #[test]

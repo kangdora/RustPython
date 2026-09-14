@@ -237,6 +237,13 @@ impl Assembler {
         self.buf.extend_from_slice(&imm.to_le_bytes());
     }
 
+    pub fn sub_mi(&mut self, base: Reg, disp: i32, imm: i32) {
+        self.rex_w(Reg::Rax, base);
+        self.byte(0x81);
+        self.modrm_mem(5, base, disp);
+        self.buf.extend_from_slice(&imm.to_le_bytes());
+    }
+
     pub fn mov_mi32(&mut self, base: Reg, disp: i32, imm: i32) {
         self.rex_w(Reg::Rax, base);
         self.byte(0xC7);
@@ -417,6 +424,10 @@ mod tests {
         assert_eq!(
             asm(|a| a.mov_mi32(Reg::Rbx, 4, -1)),
             [0x48, 0xC7, 0x83, 4, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        assert_eq!(
+            asm(|a| a.sub_mi(Reg::Rbx, 32, 1)),
+            [0x48, 0x81, 0xAB, 32, 0, 0, 0, 1, 0, 0, 0]
         );
     }
 

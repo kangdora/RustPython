@@ -21,6 +21,7 @@ flame-it = ["rustpython-vm/flame-it", "rustpython-stdlib/flame-it", "flame", "fl
 freeze-stdlib = ["stdlib", "rustpython-vm/freeze-stdlib", "rustpython-pylib?/freeze-stdlib"]
 jit = ["rustpython-vm/jit"]
 tier2 = ["rustpython-vm/tier2"]
+mimalloc = ["dep:mimalloc"]
 threading = ["rustpython-vm/threading", "rustpython-stdlib/threading"]
 sqlite = ["rustpython-stdlib/sqlite"]
 ssl = ["host_env", "rustpython-stdlib?/ssl"]
@@ -35,6 +36,7 @@ tkinter = ["rustpython-stdlib/tkinter"]
 winresource = "0.1"
 
 [dependencies]
+mimalloc = { version = "0.1", optional = true }
 rustpython-capi = { workspace = true, optional = true }
 rustpython-compiler = { workspace = true }
 rustpython-pylib = { workspace = true, optional = true }
